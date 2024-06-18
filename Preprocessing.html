@@ -618,6 +618,212 @@ med1 &lt;- med_raw %&gt;%
 </div>
 <div id="eligibility-process" class="section level1">
 <h1>Eligibility Process</h1>
+<pre class="r"><code># patients who conducted at least 1 surgery from Jan 1, 2026 to Oct 31 2021
+surgery0$pt_id %&gt;% unique() %&gt;% length() # number of unique patients</code></pre>
+<pre><code>## [1] 217439</code></pre>
+<pre class="r"><code># Age &gt;= 18
+surgery1 &lt;- surgery0 %&gt;%
+  mutate(age = age(birth_date, incision_dt)) %&gt;%
+  filter(age &gt;= 18)
+
+
+surgery1 &lt;- surgery1 %&gt;% 
+  left_join(surgery1 %&gt;% # op_id 부여 
+              select(pt_id, incision_dt, closure_dt) %&gt;%
+              distinct() %&gt;%
+              mutate(op_id = 1:n())) %&gt;%
+  filter(!is.na(op_nm))
+
+surgery1$pt_id %&gt;% unique() %&gt;% length() # number of unique patients</code></pre>
+<pre><code>## [1] 200064</code></pre>
+<pre class="r"><code>surgery1$op_id %&gt;% unique() %&gt;% length() # number of records</code></pre>
+<pre><code>## [1] 270437</code></pre>
+<pre class="r"><code># Two or more main surgeries conducted concurrently
+rmv_op_id_cd1 &lt;- surgery1 %&gt;%
+  select(op_id, surgeon_dept_cd) %&gt;%
+  distinct() %&gt;%
+  mutate(var = 1) %&gt;%
+  pivot_wider(names_from = surgeon_dept_cd, values_from = var, values_fill = 0) %&gt;%
+  rowwise() %&gt;%
+  mutate(sum = sum(GS, URO, OBGY, TS, OS, NS, ENT, PED, PS, IM3, OPH, DEN, DER, BR, CCM, IM1, AN)) %&gt;% 
+  filter(sum != 1) %&gt;%
+  pull(op_id)
+
+surgery2 &lt;- surgery1 %&gt;%
+  filter(!op_id %in% rmv_op_id_cd1) %&gt;%
+  filter(main_surgery == &quot;Y&quot;)
+
+rmv_op_id_cd2 &lt;- surgery2 %&gt;%
+  group_by(op_id) %&gt;%
+  tally() %&gt;%
+  filter(n &gt;= 2) %&gt;%
+  pull(op_id)
+
+surgery3 &lt;- surgery2 %&gt;%
+  filter(!op_id %in% rmv_op_id_cd2)
+
+matching_op_tf_df1 &lt;- surgery3 %&gt;%
+  mutate(incision_date = date(incision_dt), 
+         closure_date = date(closure_dt)) %&gt;%
+  select(pt_id, op_id, incision_date, closure_date)
+
+transfusion_order2 &lt;- transfusion_order1 %&gt;%
+  left_join(matching_op_tf_df1) %&gt;%
+  filter(ordr_date == incision_date) %&gt;%
+  select(-incision_date, -closure_date)
+
+blood_cat_df &lt;- read.csv(&quot;data/new/transfusion_category_for_descriptive_study.csv&quot;)
+
+transfusion_order3 &lt;- transfusion_order2 %&gt;%
+  left_join(blood_cat_df) %&gt;%
+  filter(blood_cat == &quot;RBC&quot;)
+
+transfusion_order4 &lt;- transfusion_order3 %&gt;%
+  select(pt_id, op_id, ordr_quan, out_quan, return_quan, disuse_quan, use_quan, acting_num) %&gt;%
+  group_by(pt_id, op_id) %&gt;%
+  summarise(ordr_quan = sum(ordr_quan), 
+            out_quan = sum(out_quan), 
+            return_quan = sum(return_quan),
+            disuse_quan = sum(disuse_quan), 
+            use_quan = sum(use_quan))
+
+
+
+# op+transfusion ----------------------------------------------------------
+surgery4 &lt;- left_join(surgery3, transfusion_order4) %&gt;%
+  mutate_at(vars(ordr_quan, out_quan, return_quan, disuse_quan, use_quan), 
+            funs(ifelse(is.na(.), 0, .))) %&gt;%
+  mutate(procedure_cd = str_replace_all(op_cd, &quot;\\.&quot;, &quot;&quot;), 
+         procedure_cd = str_replace_all(procedure_cd, &quot;[:alpha:]&quot;, &quot;&quot;)) %&gt;%
+  mutate(surgeon_dept_cd = as.character(surgeon_dept_cd)) %&gt;%
+  mutate(surgeon_dept_cd = case_when(surgeon_dept_cd %in% c(&quot;PED&quot;, &quot;AN&quot;, &quot;BR&quot;, &quot;DER&quot;) ~ &quot;etc&quot;, 
+                                     TRUE ~ surgeon_dept_cd)) %&gt;%
+  mutate(surgeon_dept_cd = factor(surgeon_dept_cd)) %&gt;%
+  mutate(anesthesia_cd = case_when(anesthesia_cd %in% c(2, 3, 6) ~ 2 %&gt;% as.character, 
+                                   anesthesia_cd %in% 4 ~ 9 %&gt;% as.character, 
+                                   TRUE ~ anesthesia_cd %&gt;% as.character))
+
+join_table_icd9cm &lt;- readxl::read_xlsx(&quot;data/new/join_table_icd9cm_handled.xlsx&quot;, col_types = c(&quot;text&quot;, &quot;text&quot;, &quot;text&quot;))
+
+
+# local sergery code join with ICD9cm code  ---------------------------------------------------------
+surgery5 &lt;- surgery4 %&gt;%
+  select(-procedure_cd, -op_nm) %&gt;%
+  left_join(join_table_icd9cm) %&gt;%
+  left_join(icd9cm, by = c(&quot;procedure_cd_fin&quot; = &quot;procedure_cd&quot;))
+
+target_procedure &lt;- surgery5 %&gt;%
+  group_by(procedure_cd_fin) %&gt;%
+  tally() %&gt;%
+  pull(procedure_cd_fin)
+
+surgery6 &lt;- surgery5 %&gt;%
+  filter(procedure_cd_fin %in% target_procedure) %&gt;%
+  mutate(transfused_yn = ifelse(use_quan == 0, 0, 1))
+
+
+# dx data -----------------------------------------------------------------
+
+data10 &lt;- data.frame(id = sample(1:10, size = 250, replace = T), 
+                     code = sample_diag(n = 250, version = &quot;ICD10_2011&quot;), 
+                     stringsAsFactors = FALSE)
+
+dx2 &lt;- left_join(surgery5 %&gt;% select(pt_id, op_id, incision_dt), 
+                 dx1) %&gt;%
+  filter(incision_dt &gt; visit_dt)
+
+load(&quot;data/new/dx3.RData&quot;) # external processing
+head(dx3)</code></pre>
+<pre><code>##   op_id ami chf pvd cevd dementia copd rheumd pud mld diab diabwc hp rend canc
+## 1     1   0   0   0    0        0    0      0   0   0    0      0  0    0    0
+## 2     2   0   0   0    0        0    0      0   0   0    0      0  0    0    0
+## 3     3   0   0   0    0        0    0      0   0   0    0      0  0    0    1
+## 4     4   0   0   0    0        0    0      0   0   0    0      0  0    0    1
+## 5     5   0   0   0    0        0    0      0   0   0    0      0  0    0    1
+## 6     6   0   0   0    0        0    0      0   0   0    0      0  0    0    1
+##   msld metacanc aids score index wscore windex
+## 1    0        0    0     0     0      0      0
+## 2    0        0    0     0     0      0      0
+## 3    0        0    0     1   1-2      2    1-2
+## 4    0        0    0     1   1-2      2    1-2
+## 5    0        0    0     1   1-2      2    1-2
+## 6    0        0    0     1   1-2      2    1-2</code></pre>
+<pre class="r"><code>total1 &lt;- surgery6 %&gt;%
+  left_join(dx3)
+
+# lab_data ----------------------------------------------------------------
+lab2 &lt;- left_join(surgery5 %&gt;% select(pt_id, op_id, incision_dt), 
+                  lab1) %&gt;%
+  mutate(gap_time = difftime(incision_dt, receive_dt, units = &quot;days&quot;) %&gt;% as.numeric) %&gt;%
+  filter(gap_time &gt;= 0 &amp; gap_time &lt;= 31) %&gt;% 
+  select(-incision_dt, -receive_dt, -unit_nm) %&gt;%
+  mutate(lab = case_when(lab_cd == &quot;BL2013&quot; ~ &quot;Hb&quot;, 
+                         lab_cd == &quot;BL2016&quot; ~ &quot;Plt&quot;, 
+                         lab_cd == &quot;BL211101&quot; ~ &quot;PT_sec&quot;,
+                         lab_cd == &quot;BL211102&quot; ~ &quot;PT_pct&quot;, 
+                         lab_cd == &quot;BL211103&quot; ~ &quot;PT_inr&quot;, 
+                         lab_cd == &quot;BL2112&quot; ~ &quot;aPTT&quot;, 
+                         lab_cd == &quot;BL2113&quot; ~ &quot;fibrinogen&quot;)) %&gt;%
+  arrange(op_id, lab, gap_time) %&gt;%
+  group_by(op_id, lab) %&gt;%
+  slice(1)
+
+lab3 &lt;- lab2 %&gt;%
+  select(op_id, lab, value) %&gt;%
+  pivot_wider(names_from = lab, values_from = value) %&gt;%
+  ungroup() %&gt;%
+  select(-`NA`)
+
+total2 &lt;- total1 %&gt;%
+  left_join(lab3) %&gt;%
+  ungroup()
+
+# med_data ----------------------------------------------------------------
+med2 &lt;- left_join(surgery5 %&gt;%select(pt_id, op_id, incision_dt), 
+                  med1) %&gt;%
+  mutate(gap_time = difftime(incision_dt, acting_time, units = &quot;days&quot;) %&gt;% as.numeric) %&gt;%
+  filter(gap_time &gt;= 0 &amp; gap_time &lt;= 3) %&gt;%
+  arrange(op_id, med_cat, gap_time) %&gt;%
+  group_by(op_id, med_cat) %&gt;%
+  slice(1)
+
+med3 &lt;- med2 %&gt;%
+  mutate(value = 1) %&gt;%
+  select(op_id, med_cat, value) %&gt;%
+  pivot_wider(names_from = med_cat, values_from = value, values_fill = 0)
+
+total3 &lt;- total2 %&gt;%
+  left_join(med3) %&gt;%
+  ungroup() %&gt;%
+  mutate_at(vars(ami:score, heparins:direct_thrombin_inhibitors), 
+            funs(ifelse(is.na(.), 0, .)))
+
+# Thoracic surgeries
+total3_ts &lt;- total3 %&gt;%
+  filter(surgeon_dept_cd == &quot;TS&quot;)
+total3_ts$pt_id %&gt;% unique() %&gt;% length() # number of unique patient</code></pre>
+<pre><code>## [1] 21046</code></pre>
+<pre class="r"><code>total3_ts$op_id %&gt;% unique() %&gt;% length() # number of records</code></pre>
+<pre><code>## [1] 23186</code></pre>
+<pre class="r"><code>total3_ts %&gt;% group_by(op_cd) %&gt;% tally() %&gt;% nrow() # number of unique op_cd</code></pre>
+<pre><code>## [1] 285</code></pre>
+<pre class="r"><code>join_table_surgery &lt;- surgery6 %&gt;%
+  group_by(procedure_cd_fin, long_description) %&gt;%
+  summarise(n = n(), 
+            # use_quan
+            sum_use_quan = sum(use_quan),
+            mean_use_quan = mean(use_quan), 
+            sd_use_quan = sd(use_quan), 
+            sigma_use_quan = sqrt(sd_use_quan^2/n), 
+            lci95_use_quan = mean_use_quan-1.96*sigma_use_quan,
+            uci95_use_quan = mean_use_quan+1.96*sigma_use_quan,
+            lci98_use_quan = mean_use_quan-2.326*sigma_use_quan,
+            uci98_use_quan = mean_use_quan+2.326*sigma_use_quan, 
+            lci99_use_quan = mean_use_quan-2.576*sigma_use_quan,
+            uci99_use_quan = mean_use_quan+2.576*sigma_use_quan, 
+            num_transfused_case = sum(transfused_yn), 
+            percent_transfused_case = (num_transfused_case/n*100) %&gt;% round(1), 
+            msbos = round(mean_use_quan, 0))</code></pre>
 <pre class="r"><code>total4 &lt;- total3_ts %&gt;%
   select(pt_id, op_id, 
          incision_dt, # for split train and test dataset
@@ -821,13 +1027,10 @@ test_df3$pt_id %&gt;% unique() %&gt;% length() # number of unique patients of th
 ## Multiple R-squared:  0.1797, Adjusted R-squared:  0.1776 
 ## F-statistic: 84.92 on 14 and 5426 DF,  p-value: &lt; 2.2e-16</code></pre>
 </div>
-<div id="data" class="section level1">
-<h1>data</h1>
-<pre class="r"><code>train_data &lt;- train_df3 %&gt;% select(ami, rend, canc, aPTT, Hb, Plt, PT_inr, coumarin_deriatives, msbos, use_quan)
-test_data &lt;- test_df3 %&gt;% select(ami, rend, canc, aPTT, Hb, Plt, PT_inr, coumarin_deriatives, msbos, use_quan)</code></pre>
-</div>
 <div id="final-data-description" class="section level1">
 <h1>Final data description</h1>
+<pre class="r"><code>train_data &lt;- train_df3 %&gt;% select(ami, rend, canc, aPTT, Hb, Plt, PT_inr, coumarin_deriatives, msbos, use_quan)
+test_data &lt;- test_df3 %&gt;% select(ami, rend, canc, aPTT, Hb, Plt, PT_inr, coumarin_deriatives, msbos, use_quan)</code></pre>
 <pre class="r"><code>head(train_data)</code></pre>
 <pre><code>##       ami   rend   canc  aPTT    Hb   Plt PT_inr coumarin_deriatives msbos
 ##    &lt;fctr&gt; &lt;fctr&gt; &lt;fctr&gt; &lt;num&gt; &lt;num&gt; &lt;num&gt;  &lt;num&gt;              &lt;fctr&gt; &lt;num&gt;
